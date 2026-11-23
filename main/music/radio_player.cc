@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <esp_log.h>
+#include <esp_wifi.h>
 
 #include "application.h"
 #include "audio_codec.h"
@@ -25,7 +26,7 @@ const char* TAG = "RadioPlayer";
 
 constexpr int kHttpTimeoutMs = 15000;
 constexpr size_t kReadBufferSize = 4096;
-constexpr size_t kPrebufferBytes = 8192;
+constexpr size_t kPrebufferBytes = 32768;   // 约 4 秒缓冲，抗网络抖动
 // minimp3 的 mp3dec_t 和单帧 PCM 都在栈上，8K 会爆栈
 constexpr uint32_t kTaskStackSize = 12288;
 constexpr UBaseType_t kTaskPriority = 3;
@@ -286,6 +287,9 @@ bool RadioPlayer::StreamOne(int index) {
         return false;
     }
 
+    // 播放期间关掉 WiFi 省电（modem sleep 会带来周期性卡顿），停止后恢复
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
     auto dec_ptr = std::make_unique<mp3dec_t>();
     mp3dec_t* dec = dec_ptr.get();
     mp3dec_init(dec);
@@ -299,7 +303,7 @@ bool RadioPlayer::StreamOne(int index) {
     std::vector<int16_t> out_frame;
     out_frame.reserve(4096);
 
-    const size_t chunk_samples = static_cast<size_t>(target_rate / 20);  // 50ms
+    const size_t chunk_samples = static_cast<size_t>(target_rate / 5);   // 200ms 一块，减少反复调用打断 I2S
     double prev_sample = 0.0;
 
     bool got_audio = false;
@@ -307,22 +311,30 @@ bool RadioPlayer::StreamOne(int index) {
     std::vector<int16_t> pcm_buffer(MINIMP3_MAX_SAMPLES_PER_FRAME);
 
     while (!stop_requested_) {
-        // 数据不足就继续读
+        // 数据不足就一次性把缓冲填满（多次读，减少“边播边等网络”造成的断续）
         if (input.size() - consumed < kPrebufferBytes) {
             if (consumed > 0) {
                 input.erase(input.begin(), input.begin() + consumed);
                 consumed = 0;
             }
-            auto size = http->Read(read_buffer.data(), read_buffer.size());
-            if (!size) {
-                ESP_LOGE(TAG, "read failed: %s", size.error().ToString().c_str());
+            for (int fill = 0; fill < 10 && !stop_requested_; fill++) {
+                if (input.size() >= kPrebufferBytes) {
+                    break;
+                }
+                auto size = http->Read(read_buffer.data(), read_buffer.size());
+                if (!size) {
+                    ESP_LOGE(TAG, "read failed: %s", size.error().ToString().c_str());
+                    break;
+                }
+                if (*size == 0) {
+                    ESP_LOGW(TAG, "stream closed");
+                    break;
+                }
+                input.insert(input.end(), read_buffer.data(), read_buffer.data() + *size);
+            }
+            if (input.empty()) {
                 break;
             }
-            if (*size == 0) {
-                ESP_LOGW(TAG, "stream closed");
-                break;
-            }
-            input.insert(input.end(), read_buffer.data(), read_buffer.data() + *size);
             continue;
         }
 
@@ -397,6 +409,7 @@ bool RadioPlayer::StreamOne(int index) {
         codec->OutputData(pending);
         pending.clear();
     }
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     http->Close();
     http.reset();
     ESP_LOGI(TAG, "stream stopped, got_audio=%d", got_audio ? 1 : 0);
