@@ -4,10 +4,15 @@
 #include <esp_log.h>
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
-// 与原生界面使用同一套内置字体，保证中文正常显示。
+#include "board.h"
+#include "display.h"
+#include "lvgl_display/lvgl_font.h"
+
+// 原生界面用的内置字体（只有拉丁字符，中文靠服务器下发的字形）
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 
 namespace {
@@ -28,7 +33,20 @@ std::string g_status_text;                  // 额外状态（音乐、模式提
 std::vector<std::string> g_lines;           // 已折行的字幕历史
 size_t g_first_line = 0;                    // 当前页起始行
 
-int TextLineHeight() { return lv_font_get_line_height(&BUILTIN_TEXT_FONT); }
+// 优先使用原生界面的运行时字体：它挂了“服务器下发字形”的 fallback，
+// 用它才能把中文正常显示出来（内置字体只有拉丁字符，中文会变成乱码/方块）。
+const lv_font_t* BlackboardFont() {
+    Display* display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
+        auto text_font = display->GetTextFont();
+        if (text_font != nullptr && text_font->font() != nullptr) {
+            return text_font->font();
+        }
+    }
+    return &BUILTIN_TEXT_FONT;
+}
+
+int TextLineHeight() { return lv_font_get_line_height(BlackboardFont()); }
 
 // 版面里一页能放多少行。
 int LinesPerPage() {
@@ -133,14 +151,14 @@ void EnsureInit() {
     g_status_label = lv_label_create(g_root);
     lv_obj_set_width(g_status_label, lv_pct(100));
     lv_obj_set_style_text_color(g_status_label, lv_color_hex(0xA0A0A0), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_status_label, &BUILTIN_TEXT_FONT, LV_PART_MAIN);
+    lv_obj_set_style_text_font(g_status_label, BlackboardFont(), LV_PART_MAIN);
     lv_label_set_text(g_status_label, "黑板字幕");
 
     g_chat_label = lv_label_create(g_root);
     lv_obj_set_width(g_chat_label, lv_pct(100));
     lv_obj_set_flex_grow(g_chat_label, 1);
     lv_obj_set_style_text_color(g_chat_label, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_chat_label, &BUILTIN_TEXT_FONT, LV_PART_MAIN);
+    lv_obj_set_style_text_font(g_chat_label, BlackboardFont(), LV_PART_MAIN);
     lv_obj_set_style_text_align(g_chat_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
     lv_label_set_long_mode(g_chat_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(g_chat_label, "");
@@ -157,6 +175,9 @@ void Refresh() {
     if (g_chat_label == nullptr || g_status_label == nullptr) {
         return;
     }
+    // 主题字体可能在资源加载后被替换过，每页刷新时重新挂一次，避免用旧字体渲染中文。
+    lv_obj_set_style_text_font(g_status_label, BlackboardFont(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(g_chat_label, BlackboardFont(), LV_PART_MAIN);
     int per_page = LinesPerPage();
     size_t total = g_lines.size();
     if (total == 0) {
