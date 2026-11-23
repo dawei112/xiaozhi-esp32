@@ -27,6 +27,10 @@ const int kFallbackLinesPerPage = 8;
 lv_obj_t* g_root = nullptr;        // 全屏黑板容器（挂在 lv_layer_top 上）
 lv_obj_t* g_status_label = nullptr;  // 顶部状态行
 lv_obj_t* g_chat_label = nullptr;    // 正文
+lv_obj_t* g_shadow_a = nullptr;      // 正文的加粗描边层（右）
+lv_obj_t* g_shadow_b = nullptr;      // 正文的加粗描边层（下）
+lv_timer_t* g_rainbow_timer = nullptr;  // 文字颜色实时渐变
+uint16_t g_rainbow_hue = 0;
 bool g_inited = false;
 bool g_blackboard_mode = false;
 std::string g_status_text;                  // 额外状态（音乐、模式提示）
@@ -125,6 +129,26 @@ void WrapString(const std::string& in, std::vector<std::string>& out, int max_ha
     }
 }
 
+// 正文（含加粗描边层）统一改色。
+void ApplyTextColor(lv_color_t color) {
+    if (g_chat_label != nullptr) {
+        lv_obj_set_style_text_color(g_chat_label, color, LV_PART_MAIN);
+    }
+    if (g_shadow_a != nullptr) {
+        lv_obj_set_style_text_color(g_shadow_a, color, LV_PART_MAIN);
+    }
+    if (g_shadow_b != nullptr) {
+        lv_obj_set_style_text_color(g_shadow_b, color, LV_PART_MAIN);
+    }
+}
+
+// 定时器：色相缓慢推进，让黑板文字颜色实时流转。
+void RainbowTimerCb(lv_timer_t* timer) {
+    (void)timer;
+    g_rainbow_hue = static_cast<uint16_t>((g_rainbow_hue + 3) % 360);
+    ApplyTextColor(lv_color_hsv_to_rgb(g_rainbow_hue, 90, 100));
+}
+
 // 必须在持有 LVGL 锁的情况下调用。
 void EnsureInit() {
     if (g_inited) {
@@ -160,6 +184,26 @@ void EnsureInit() {
     lv_obj_set_style_text_font(g_status_label, BlackboardFont(), LV_PART_MAIN);
     lv_label_set_text(g_status_label, "黑板字幕");
 
+    // 加粗（近似黑体）效果：正文下方先铺两层同样文字、错开 1 像素的同色描边，
+    // 真正的那一份再盖上去，笔画就会显粗。描边层不参与 flex 布局。
+    g_shadow_a = lv_label_create(g_root);
+    g_shadow_b = lv_label_create(g_root);
+    lv_obj_t* shadows[2] = {g_shadow_a, g_shadow_b};
+    for (int i = 0; i < 2; ++i) {
+        lv_obj_t* s = shadows[i];
+        lv_obj_add_flag(s, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_remove_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_width(s, lv_pct(100));
+        lv_obj_set_style_bg_opa(s, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(s, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(s, 0, LV_PART_MAIN);
+        lv_obj_set_style_text_font(s, BlackboardFont(), LV_PART_MAIN);
+        lv_obj_set_style_text_color(s, lv_color_white(), LV_PART_MAIN);
+        lv_obj_set_style_text_align(s, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+        lv_label_set_long_mode(s, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(s, "");
+    }
+
     g_chat_label = lv_label_create(g_root);
     lv_obj_set_width(g_chat_label, lv_pct(100));
     lv_obj_set_flex_grow(g_chat_label, 1);
@@ -169,11 +213,38 @@ void EnsureInit() {
     lv_label_set_long_mode(g_chat_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(g_chat_label, "");
 
+    // 文字颜色实时流转。
+    if (g_rainbow_timer == nullptr) {
+        g_rainbow_timer = lv_timer_create(RainbowTimerCb, 120, nullptr);
+    }
+    ApplyTextColor(lv_color_hsv_to_rgb(g_rainbow_hue, 90, 100));
+
     // 先做一次布局，保证宽高可用（否则首屏行数会用到兜底值）。
     lv_obj_update_layout(g_root);
 
     lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     g_inited = true;
+}
+
+// 同时更新正文与其描边层，并把描边层对准正文（错开 1 像素形成加粗）。
+void SetBodyText(const std::string& body) {
+    if (g_chat_label == nullptr) {
+        return;
+    }
+    lv_label_set_text(g_chat_label, body.c_str());
+    if (g_shadow_a != nullptr) {
+        lv_label_set_text(g_shadow_a, body.c_str());
+    }
+    if (g_shadow_b != nullptr) {
+        lv_label_set_text(g_shadow_b, body.c_str());
+    }
+    lv_obj_update_layout(g_chat_label);
+    if (g_shadow_a != nullptr) {
+        lv_obj_align_to(g_shadow_a, g_chat_label, LV_ALIGN_TOP_LEFT, 1, 0);
+    }
+    if (g_shadow_b != nullptr) {
+        lv_obj_align_to(g_shadow_b, g_chat_label, LV_ALIGN_TOP_LEFT, 0, 1);
+    }
 }
 
 // 必须在持有 LVGL 锁的情况下调用。
@@ -187,7 +258,7 @@ void Refresh() {
     int per_page = LinesPerPage();
     size_t total = g_lines.size();
     if (total == 0) {
-        lv_label_set_text(g_chat_label, "");
+        SetBodyText("");
         std::string title = g_status_text.empty() ? "黑板字幕" : g_status_text;
         title += "  [0/0]";
         lv_label_set_text(g_status_label, title.c_str());
@@ -217,7 +288,7 @@ void Refresh() {
         body += g_lines[i];
         body += "\n";
     }
-    lv_label_set_text(g_chat_label, body.c_str());
+    SetBodyText(body);
 }
 
 // 必须在持有 LVGL 锁的情况下调用。follow_tail 为 true 时视图跟随最新内容。
@@ -298,11 +369,11 @@ void lv_display_append_message(const char* role, const char* text) {
         return;
     }
     std::string role_str = role == nullptr ? "" : role;
-    std::string prefix = "智脑：";
+    // 黑板只显示小智说的内容：用户自己说的话不上屏，也不加任何前缀。
     if (role_str == "user") {
-        prefix = "我：";
+        return;
     }
-    std::string body = prefix + text;
+    std::string body = text;
     if (!lvgl_port_lock(1000)) {
         return;
     }
