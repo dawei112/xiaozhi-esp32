@@ -302,7 +302,8 @@ bool RadioPlayer::StreamOne(int index) {
     double prev_sample = 0.0;
 
     bool got_audio = false;
-    std::array<char, kReadBufferSize> read_buffer;
+    std::vector<char> read_buffer(kReadBufferSize);
+    std::vector<int16_t> pcm_buffer(MINIMP3_MAX_SAMPLES_PER_FRAME);
 
     while (!stop_requested_) {
         // 数据不足就继续读
@@ -326,7 +327,7 @@ bool RadioPlayer::StreamOne(int index) {
 
         mp3dec_frame_info_t info;
         memset(&info, 0, sizeof(info));
-        int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+        int16_t* pcm = pcm_buffer.data();
         int samples = mp3dec_decode_frame(&dec, input.data() + consumed,
                                          static_cast<int>(input.size() - consumed), pcm, &info);
         if (info.frame_bytes == 0) {
