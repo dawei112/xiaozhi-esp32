@@ -286,8 +286,9 @@ bool RadioPlayer::StreamOne(int index) {
         return false;
     }
 
-    mp3dec_t dec;
-    mp3dec_init(&dec);
+    auto dec_ptr = std::make_unique<mp3dec_t>();
+    mp3dec_t* dec = dec_ptr.get();
+    mp3dec_init(dec);
 
     std::vector<uint8_t> input;
     input.reserve(kPrebufferBytes * 2);
@@ -328,7 +329,7 @@ bool RadioPlayer::StreamOne(int index) {
         mp3dec_frame_info_t info;
         memset(&info, 0, sizeof(info));
         int16_t* pcm = pcm_buffer.data();
-        int samples = mp3dec_decode_frame(&dec, input.data() + consumed,
+        int samples = mp3dec_decode_frame(dec, input.data() + consumed,
                                          static_cast<int>(input.size() - consumed), pcm, &info);
         if (info.frame_bytes == 0) {
             // 还没凑够一帧，等更多数据
