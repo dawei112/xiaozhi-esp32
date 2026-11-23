@@ -145,6 +145,10 @@ void EnsureInit() {
     lv_obj_set_style_bg_opa(g_root, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(g_root, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(g_root, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_dir(g_root, LV_GRAD_DIR_NONE, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(g_root, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(g_root, 0, LV_PART_MAIN);
+    lv_obj_set_style_opa(g_root, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_pad_all(g_root, 4, LV_PART_MAIN);
     lv_obj_set_style_pad_row(g_root, 2, LV_PART_MAIN);
     lv_obj_set_flex_flow(g_root, LV_FLEX_FLOW_COLUMN);
@@ -262,11 +266,14 @@ void lv_display_switch_blackboard(bool enable) {
     if (g_root != nullptr) {
         g_blackboard_mode = enable;
         if (enable) {
+            // 原生界面整屏隐藏，保证整屏纯黑、不被上层 UI 抢焦点
+            lv_obj_add_flag(lv_screen_active(), LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(g_root);
             lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
             Refresh();
         } else {
             lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(lv_screen_active(), LV_OBJ_FLAG_HIDDEN);
         }
     }
     lvgl_port_unlock();
