@@ -36,11 +36,13 @@ size_t g_first_line = 0;                    // 当前页起始行
 // 优先使用原生界面的运行时字体：它挂了“服务器下发字形”的 fallback，
 // 用它才能把中文正常显示出来（内置字体只有拉丁字符，中文会变成乱码/方块）。
 const lv_font_t* BlackboardFont() {
-    Display* display = Board::GetInstance().GetDisplay();
-    if (display != nullptr) {
-        auto text_font = display->GetTextFont();
-        if (text_font != nullptr && text_font->font() != nullptr) {
-            return text_font->font();
+    // 屏幕的样式字体就是界面运行时字体（已挂服务器字形 fallback），
+    // 直接取屏幕当前样式字体，中文才能正常显示。
+    lv_obj_t* screen = lv_screen_active();
+    if (screen != nullptr) {
+        const lv_font_t* font = lv_obj_get_style_text_font(screen, LV_PART_MAIN);
+        if (font != nullptr) {
+            return font;
         }
     }
     return &BUILTIN_TEXT_FONT;
