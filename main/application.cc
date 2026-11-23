@@ -182,12 +182,12 @@ void Application::Initialize() {
             return std::string("已显示在黑板上");
         });
     mcp_server.AddTool("self.blackboard_clear", "清空黑板字幕内容",
-                       PropertyList({}), [](const PropertyList&) -> ToolResult {
+                       PropertyList(std::vector<Property>{}), [](const PropertyList&) -> ToolResult {
                            Application::GetInstance().Schedule([]() { lv_display_clear(); });
                            return std::string("黑板已清空");
                        });
     mcp_server.AddTool("self.blackboard_close", "退出黑板模式，回到默认表情界面",
-                       PropertyList({}), [](const PropertyList&) -> ToolResult {
+                       PropertyList(std::vector<Property>{}), [](const PropertyList&) -> ToolResult {
                            Application::GetInstance().Schedule(
                                []() { lv_display_switch_blackboard(false); });
                            return std::string("已退出黑板模式");
@@ -209,13 +209,13 @@ void Application::Initialize() {
             }
             return std::string("开始播放音乐");
         });
-    mcp_server.AddTool("self.music_stop", "停止播放音乐", PropertyList({}),
+    mcp_server.AddTool("self.music_stop", "停止播放音乐", PropertyList(std::vector<Property>{}),
                        [](const PropertyList&) -> ToolResult {
                            MusicPlayer::GetInstance().Stop(2000);
                            return std::string("音乐已停止");
                        });
     mcp_server.AddTool("self.radio_list", "列出设备内置的网络电台频道名，可用于挑选要播放的电台",
-                       PropertyList({}), [](const PropertyList&) -> ToolResult {
+                       PropertyList(std::vector<Property>{}), [](const PropertyList&) -> ToolResult {
                            RadioPlayer& radio = RadioPlayer::GetInstance();
                            std::string out;
                            for (int i = 0; i < radio.StationCount(); i++) {
@@ -244,13 +244,13 @@ void Application::Initialize() {
             });
             return std::string("正在播放: " + title);
         });
-    mcp_server.AddTool("self.radio_next", "切换到下一个网络电台频道", PropertyList({}),
+    mcp_server.AddTool("self.radio_next", "切换到下一个网络电台频道", PropertyList(std::vector<Property>{}),
                        [](const PropertyList&) -> ToolResult {
                            RadioPlayer& radio = RadioPlayer::GetInstance();
                            radio.Next();
                            return std::string("已切到: " + radio.CurrentStationName());
                        });
-    mcp_server.AddTool("self.radio_stop", "关闭网络电台广播", PropertyList({}),
+    mcp_server.AddTool("self.radio_stop", "关闭网络电台广播", PropertyList(std::vector<Property>{}),
                        [](const PropertyList&) -> ToolResult {
                            RadioPlayer::GetInstance().Stop(2000);
                            return std::string("电台已关闭");
@@ -865,14 +865,17 @@ void Application::InitializeProtocol() {
                         if (pos != std::string::npos && pos + 1 < station_name.size()) {
                             station_name = station_name.substr(pos + 1);
                         }
-                        for (size_t i = 0; i < station_name.size(); i++) {
-                            if (station_name[i] == '台' || station_name[i] == '吧' ||
-                                station_name[i] == '。' || station_name[i] == '.' ||
-                                station_name[i] == '!' || station_name[i] == '!' ||
-                                station_name[i] == '?') {
-                                station_name = station_name.substr(0, i);
-                                break;
+                        // 去掉句末的语气词和标点
+                        const std::vector<std::string> kTailMarkers = {"台", "吧", "。", ".", "!", "?", "！", "？"};
+                        size_t cut = std::string::npos;
+                        for (const auto& marker : kTailMarkers) {
+                            size_t p = station_name.rfind(marker);
+                            if (p != std::string::npos && p < cut) {
+                                cut = p;
                             }
+                        }
+                        if (cut != std::string::npos) {
+                            station_name = station_name.substr(0, cut);
                         }
                         if (station_name.size() >= 2 && station_name != "电台" &&
                             station_name != "广播" && station_name != "收音机") {
