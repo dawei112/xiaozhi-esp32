@@ -335,7 +335,7 @@ bool RadioPlayer::StreamOne(int index) {
             continue;
         }
         consumed += static_cast<size_t>(info.frame_bytes);
-        if (samples <= 0 || info.channels <= 0 || info.sample_rate <= 0) {
+        if (samples <= 0 || info.channels <= 0 || info.hz <= 0) {
             continue;
         }
         got_audio = true;
@@ -359,7 +359,7 @@ bool RadioPlayer::StreamOne(int index) {
         }
 
         // 线性插值重采样到喇叭采样率
-        double step = static_cast<double>(info.sample_rate) / static_cast<double>(target_rate);
+        double step = static_cast<double>(info.hz) / static_cast<double>(target_rate);
         if (step < 0.0001) {
             step = 1.0;
         }
