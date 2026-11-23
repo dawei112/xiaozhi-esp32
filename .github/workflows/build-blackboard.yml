@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -26,11 +26,25 @@ jobs:
           VARIANT: zhengchen-cam
         run: |
           source "$IDF_PATH/export.sh"
-          python scripts/build.py "$BOARD" --name "$VARIANT"
+          python scripts/build.py "$BOARD" --name "$VARIANT" --language zh-CN
+          cp build/merged-binary.bin zhengchen-cam-blackboard.bin
 
-      - name: Upload firmware
+      - name: Upload firmware artifact
         uses: actions/upload-artifact@v7
         with:
           name: xiaozhi_blackboard_zhengchen-cam
-          path: build/merged-binary.bin
+          path: zhengchen-cam-blackboard.bin
           if-no-files-found: error
+
+      - name: Publish firmware release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: blackboard-${{ github.run_number }}
+          name: 黑板固件 zhengchen-cam #${{ github.run_number }}
+          body: |
+            黑白板字幕 + 听歌功能固件（esp32s3 / zhengchen-cam / 240x320）
+            烧录地址 0x0，选择 merged 合并固件。
+          files: zhengchen-cam-blackboard.bin
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
