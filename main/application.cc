@@ -6,6 +6,7 @@
 #include "cjson_utils.h"
 #include "display.h"
 #include "blackboard_display.h"
+#include "music_player.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -19,9 +20,44 @@
 #include <cJSON.h>
 #include <algorithm>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 
 #define TAG "Application"
+
+namespace {
+
+// 语音指令匹配：去掉空白与常见标点后再判断，避免 ASR 结果末尾带标点导致匹配失败。
+std::string NormalizeVoiceText(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            continue;
+        }
+        if (c == '.' || c == ',' || c == '!' || c == '?' || c == ';' || c == ':') {
+            continue;
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+
+bool VoiceCommandMatch(const std::string& text, std::initializer_list<const char*> keys) {
+    std::string norm = NormalizeVoiceText(text);
+    // 太长的句子按正常对话处理，不抢指令。
+    if (norm.size() > 36) {
+        return false;
+    }
+    for (auto key : keys) {
+        if (norm.find(key) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -689,8 +725,7 @@ void Application::InitializeProtocol() {
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
-                        std::string ai_line = "智脑：" + message;
-                        lv_display_append_chat(ai_line.c_str());
+                        lv_display_append_message("assistant", message.c_str());
                     });
                 }
             }
@@ -707,12 +742,47 @@ void Application::InitializeProtocol() {
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
-                    std::string user_line = "我：" + message;
-                    lv_display_append_chat(user_line.c_str());
-                    if (message.find("黑板模式") != std::string::npos) {
+                    lv_display_append_message("user", message.c_str());
+                    // ---- 黑板模式 / 翻页 / 清屏 / 听歌 语音指令 ----
+                    if (VoiceCommandMatch(message, {"黑板模式", "打开黑板", "开启黑板", "显示黑板",
+                                                    "写在黑板上", "显示在黑板上"})) {
                         lv_display_switch_blackboard(true);
-                    } else if (message.find("默认模式") != std::string::npos) {
+                        lv_display_set_status("黑板模式");
+                    } else if (VoiceCommandMatch(message, {"默认模式", "关闭黑板", "退出黑板",
+                                                          "关掉黑板"})) {
                         lv_display_switch_blackboard(false);
+                    } else if (VoiceCommandMatch(message, {"清屏", "清空黑板", "清空屏幕",
+                                                          "清除字幕"})) {
+                        lv_display_switch_blackboard(true);
+                        lv_display_clear();
+                    } else if (VoiceCommandMatch(message, {"上一页", "向前翻页", "往前翻"})) {
+                        lv_display_page_prev();
+                    } else if (VoiceCommandMatch(message, {"下一页", "向后翻页", "往后翻"})) {
+                        lv_display_page_next();
+                    } else if (VoiceCommandMatch(message, {"放首歌", "听歌", "来首歌", "放首音乐",
+                                                          "播放音乐", "开始听歌"})) {
+                        lv_display_switch_blackboard(true);
+                        MusicPlayer& player = MusicPlayer::GetInstance();
+                        std::vector<MusicTrack> list = player.GetPlaylist();
+                        std::string title = list.empty() ? std::string("音乐") : list.front().title;
+                        if (player.PlayDefault()) {
+                            lv_display_set_status(("♪ 播放中：" + title).c_str());
+                        } else {
+                            lv_display_set_status("♪ 播放失败");
+                        }
+                    } else if (VoiceCommandMatch(message, {"暂停播放", "暂停音乐", "暂停放歌"})) {
+                        MusicPlayer::GetInstance().Pause();
+                        lv_display_set_status("♪ 已暂停");
+                    } else if (VoiceCommandMatch(message, {"继续播放", "接着播放", "继续放歌",
+                                                          "恢复播放"})) {
+                        MusicPlayer::GetInstance().Resume();
+                        lv_display_set_status("♪ 继续播放");
+                    } else if (VoiceCommandMatch(message, {"停止播放", "停止音乐", "关掉音乐",
+                                                          "别放了"})) {
+                        MusicPlayer::GetInstance().Stop(2000);
+                        lv_display_set_status("♪ 已停止");
+                    } else if (VoiceCommandMatch(message, {"下一首", "切歌", "换一首"})) {
+                        MusicPlayer::GetInstance().Next();
                     }
                 });
             }
@@ -950,6 +1020,12 @@ void Application::HandleWakeWordDetectedEvent() {
     auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+
+    // 用户说话时先暂停背景音乐，避免和语音回复混在一起（说“继续播放”即可恢复）。
+    if (MusicPlayer::GetInstance().IsPlaying()) {
+        MusicPlayer::GetInstance().Pause();
+        lv_display_set_status("♪ 音乐已暂停");
+    }
 
     if (state == kDeviceStateIdle) {
         BeginWakeWordInvoke(wake_word);
