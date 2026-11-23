@@ -5,6 +5,7 @@
 #include "board.h"
 #include "cjson_utils.h"
 #include "display.h"
+#include "blackboard_display.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -688,6 +689,8 @@ void Application::InitializeProtocol() {
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
+                        std::string ai_line = "智脑：" + message;
+                        lv_display_append_chat(ai_line.c_str());
                     });
                 }
             }
@@ -704,6 +707,13 @@ void Application::InitializeProtocol() {
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
+                    std::string user_line = "我：" + message;
+                    lv_display_append_chat(user_line.c_str());
+                    if (message.find("黑板模式") != std::string::npos) {
+                        lv_display_switch_blackboard(true);
+                    } else if (message.find("默认模式") != std::string::npos) {
+                        lv_display_switch_blackboard(false);
+                    }
                 });
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
