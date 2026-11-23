@@ -16,7 +16,7 @@ namespace {
 
 const char* TAG = "MusicPlayer";
 
-constexpr int kHttpTimeoutMs = 3000;
+constexpr int kHttpTimeoutMs = 15000;
 constexpr size_t kHttpReadBufferSize = 1024;
 constexpr uint32_t kTaskStackSize = 6144;
 constexpr UBaseType_t kTaskPriority = 3;
