@@ -1,28 +1,71 @@
 #include "blackboard_display.h"
 
 #include <esp_lvgl_port.h>
+#include <esp_log.h>
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
-// Use the same built-in text font as the rest of the UI so Chinese renders correctly.
+// 与原生界面使用同一套内置字体，保证中文正常显示。
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 
 namespace {
 
-const int kMaxLine = 12;
-const int kMaxCharPerLine = 42;
+const char* TAG = "Blackboard";
 
-lv_obj_t* g_blackboard = nullptr;
-lv_obj_t* g_label_chat = nullptr;
-bool g_blackboard_mode = false;
+// 字幕历史最多保留的行数，超出后丢弃最早的行。
+const size_t kMaxHistoryLines = 240;
+// 版面尚未完成布局时的兜底行数。
+const int kFallbackLinesPerPage = 8;
+
+lv_obj_t* g_root = nullptr;        // 全屏黑板容器（挂在 lv_layer_top 上）
+lv_obj_t* g_status_label = nullptr;  // 顶部状态行
+lv_obj_t* g_chat_label = nullptr;    // 正文
 bool g_inited = false;
-std::vector<std::string> g_chat_lines;
+bool g_blackboard_mode = false;
+std::string g_status_text;                  // 额外状态（音乐、模式提示）
+std::vector<std::string> g_lines;           // 已折行的字幕历史
+size_t g_first_line = 0;                    // 当前页起始行
 
-// UTF-8 aware line wrapping: never split a multi-byte character.
-void wrap_string(const std::string& in, std::vector<std::string>& out) {
+int TextLineHeight() { return lv_font_get_line_height(&BUILTIN_TEXT_FONT); }
+
+// 版面里一页能放多少行。
+int LinesPerPage() {
+    if (g_chat_label == nullptr) {
+        return kFallbackLinesPerPage;
+    }
+    int line_height = TextLineHeight();
+    int height = lv_obj_get_content_height(g_chat_label);
+    if (line_height <= 0 || height <= 0) {
+        return kFallbackLinesPerPage;
+    }
+    int lines = height / line_height;
+    return lines > 0 ? lines : 1;
+}
+
+// 估算每行能放多少“半角字符宽度”：中文按 2 个半角宽度计算。
+int HalfWidthsPerLine() {
+    if (g_chat_label == nullptr) {
+        return 40;
+    }
+    int line_height = TextLineHeight();
+    int width = lv_obj_get_content_width(g_chat_label);
+    if (line_height <= 0 || width <= 0) {
+        return 40;
+    }
+    int half_width = line_height / 2;
+    if (half_width < 1) {
+        half_width = 1;
+    }
+    int count = width / half_width;
+    return count < 8 ? 8 : count;
+}
+
+// 按显示宽度折行，且绝不切断 UTF-8 多字节字符。
+void WrapString(const std::string& in, std::vector<std::string>& out, int max_half_widths) {
     std::string line;
-    int count = 0;
+    int width = 0;
     size_t i = 0;
     while (i < in.size()) {
         unsigned char c = static_cast<unsigned char>(in[i]);
@@ -42,26 +85,28 @@ void wrap_string(const std::string& in, std::vector<std::string>& out) {
         if (c == '\n') {
             out.push_back(line);
             line.clear();
-            count = 0;
+            width = 0;
             i += len;
             continue;
         }
-        line.append(in, i, len);
-        i += len;
-        count++;
-        if (count >= kMaxCharPerLine) {
+        // 中文/全角字符按两个半角宽度计算。
+        int char_width = (len >= 3) ? 2 : 1;
+        if (width + char_width > max_half_widths && !line.empty()) {
             out.push_back(line);
             line.clear();
-            count = 0;
+            width = 0;
         }
+        line.append(in, i, len);
+        width += char_width;
+        i += len;
     }
     if (!line.empty()) {
         out.push_back(line);
     }
 }
 
-// Must be called while the LVGL lock is held.
-void ensure_init() {
+// 必须在持有 LVGL 锁的情况下调用。
+void EnsureInit() {
     if (g_inited) {
         return;
     }
@@ -69,41 +114,111 @@ void ensure_init() {
     if (top == nullptr) {
         return;
     }
-    g_blackboard = lv_obj_create(top);
-    if (g_blackboard == nullptr) {
+    g_root = lv_obj_create(top);
+    if (g_root == nullptr) {
         return;
     }
-    lv_obj_remove_flag(g_blackboard, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(g_blackboard, lv_pct(100), lv_pct(100));
-    lv_obj_set_pos(g_blackboard, 0, 0);
-    lv_obj_set_style_bg_color(g_blackboard, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(g_blackboard, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(g_blackboard, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(g_blackboard, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(g_blackboard, 4, LV_PART_MAIN);
+    lv_obj_remove_flag(g_root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(g_root, lv_pct(100), lv_pct(100));
+    lv_obj_set_pos(g_root, 0, 0);
+    lv_obj_set_style_bg_color(g_root, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_root, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_root, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(g_root, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_root, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(g_root, 2, LV_PART_MAIN);
+    lv_obj_set_flex_flow(g_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(g_root, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    g_label_chat = lv_label_create(g_blackboard);
-    lv_obj_set_style_text_color(g_label_chat, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_text_font(g_label_chat, &BUILTIN_TEXT_FONT, LV_PART_MAIN);
-    lv_label_set_long_mode(g_label_chat, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(g_label_chat, lv_pct(100));
-    lv_obj_align(g_label_chat, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_label_set_text(g_label_chat, "");
+    g_status_label = lv_label_create(g_root);
+    lv_obj_set_width(g_status_label, lv_pct(100));
+    lv_obj_set_style_text_color(g_status_label, lv_color_hex(0xA0A0A0), LV_PART_MAIN);
+    lv_obj_set_style_text_font(g_status_label, &BUILTIN_TEXT_FONT, LV_PART_MAIN);
+    lv_label_set_text(g_status_label, "黑板字幕");
 
-    lv_obj_add_flag(g_blackboard, LV_OBJ_FLAG_HIDDEN);
+    g_chat_label = lv_label_create(g_root);
+    lv_obj_set_width(g_chat_label, lv_pct(100));
+    lv_obj_set_flex_grow(g_chat_label, 1);
+    lv_obj_set_style_text_color(g_chat_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(g_chat_label, &BUILTIN_TEXT_FONT, LV_PART_MAIN);
+    lv_obj_set_style_text_align(g_chat_label, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_label_set_long_mode(g_chat_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(g_chat_label, "");
+
+    // 先做一次布局，保证宽高可用（否则首屏行数会用到兜底值）。
+    lv_obj_update_layout(g_root);
+
+    lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
     g_inited = true;
 }
 
-void refresh_blackboard_text() {
-    if (g_label_chat == nullptr) {
+// 必须在持有 LVGL 锁的情况下调用。
+void Refresh() {
+    if (g_chat_label == nullptr || g_status_label == nullptr) {
         return;
     }
-    std::string all;
-    for (auto& l : g_chat_lines) {
-        all += l;
-        all += "\n";
+    int per_page = LinesPerPage();
+    size_t total = g_lines.size();
+    if (total == 0) {
+        lv_label_set_text(g_chat_label, "");
+        std::string title = g_status_text.empty() ? "黑板字幕" : g_status_text;
+        title += "  [0/0]";
+        lv_label_set_text(g_status_label, title.c_str());
+        return;
     }
-    lv_label_set_text(g_label_chat, all.c_str());
+    if (g_first_line + per_page > total) {
+        g_first_line = total > static_cast<size_t>(per_page)
+                           ? total - static_cast<size_t>(per_page)
+                           : 0;
+    }
+    size_t pages = (total + per_page - 1) / per_page;
+    if (pages == 0) {
+        pages = 1;
+    }
+    size_t page_no = g_first_line / per_page + 1;
+
+    std::string title = g_status_text.empty() ? "黑板字幕" : g_status_text;
+    title += "  [";
+    title += std::to_string(page_no);
+    title += "/";
+    title += std::to_string(pages);
+    title += "]";
+    lv_label_set_text(g_status_label, title.c_str());
+
+    std::string body;
+    for (size_t i = g_first_line; i < total && i < g_first_line + static_cast<size_t>(per_page); ++i) {
+        body += g_lines[i];
+        body += "\n";
+    }
+    lv_label_set_text(g_chat_label, body.c_str());
+}
+
+// 必须在持有 LVGL 锁的情况下调用。follow_tail 为 true 时视图跟随最新内容。
+void AppendLocked(const std::string& text, bool follow_tail, bool reset_to_start) {
+    if (text.empty()) {
+        return;
+    }
+    std::vector<std::string> wrapped;
+    WrapString(text, wrapped, HalfWidthsPerLine());
+    size_t message_start = g_lines.size();
+    for (auto& line : wrapped) {
+        g_lines.push_back(line);
+    }
+    if (g_lines.size() > kMaxHistoryLines) {
+        size_t drop = g_lines.size() - kMaxHistoryLines;
+        g_lines.erase(g_lines.begin(), g_lines.begin() + static_cast<std::ptrdiff_t>(drop));
+        message_start = message_start > drop ? message_start - drop : 0;
+    }
+    if (reset_to_start) {
+        // 新一轮对话：从这段内容的开头显示，长讲解可以按“下一页”往后读。
+        g_first_line = message_start;
+    } else if (follow_tail) {
+        int per_page = LinesPerPage();
+        g_first_line = g_lines.size() > static_cast<size_t>(per_page)
+                           ? g_lines.size() - static_cast<size_t>(per_page)
+                           : 0;
+    }
+    Refresh();
 }
 
 }  // namespace
@@ -112,7 +227,7 @@ void lv_display_init() {
     if (!lvgl_port_lock(1000)) {
         return;
     }
-    ensure_init();
+    EnsureInit();
     lvgl_port_unlock();
 }
 
@@ -120,14 +235,15 @@ void lv_display_switch_blackboard(bool enable) {
     if (!lvgl_port_lock(1000)) {
         return;
     }
-    ensure_init();
-    if (g_blackboard != nullptr) {
+    EnsureInit();
+    if (g_root != nullptr) {
         g_blackboard_mode = enable;
         if (enable) {
-            lv_obj_move_foreground(g_blackboard);
-            lv_obj_remove_flag(g_blackboard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(g_root);
+            lv_obj_remove_flag(g_root, LV_OBJ_FLAG_HIDDEN);
+            Refresh();
         } else {
-            lv_obj_add_flag(g_blackboard, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(g_root, LV_OBJ_FLAG_HIDDEN);
         }
     }
     lvgl_port_unlock();
@@ -142,23 +258,98 @@ void lv_display_append_chat(const char* line) {
     if (!lvgl_port_lock(1000)) {
         return;
     }
-    ensure_init();
-    std::vector<std::string> wrapped;
-    wrap_string(std::string(line), wrapped);
-    for (auto& s : wrapped) {
-        g_chat_lines.push_back(s);
-        if (static_cast<int>(g_chat_lines.size()) > kMaxLine) {
-            g_chat_lines.erase(g_chat_lines.begin());
-        }
-    }
-    refresh_blackboard_text();
+    EnsureInit();
+    AppendLocked(std::string(line), true, false);
     lvgl_port_unlock();
 }
 
-// Status hooks are no-ops on purpose: the original emoji UI keeps running under the overlay.
-void lv_display_set_wake_up() {}
+void lv_display_append_message(const char* role, const char* text) {
+    if (text == nullptr || text[0] == '\0') {
+        return;
+    }
+    std::string role_str = role == nullptr ? "" : role;
+    std::string prefix = "智脑：";
+    if (role_str == "user") {
+        prefix = "我：";
+    }
+    std::string body = prefix + text;
+    if (!lvgl_port_lock(1000)) {
+        return;
+    }
+    EnsureInit();
+    // 字幕式滚动：始终跟到最新一行，需要回看时用“上一页”。
+    AppendLocked(body, true, false);
+    lvgl_port_unlock();
+}
+
+void lv_display_clear() {
+    if (!lvgl_port_lock(1000)) {
+        return;
+    }
+    EnsureInit();
+    g_lines.clear();
+    g_first_line = 0;
+    Refresh();
+    lvgl_port_unlock();
+}
+
+void lv_display_page_next() {
+    if (!lvgl_port_lock(1000)) {
+        return;
+    }
+    EnsureInit();
+    int per_page = LinesPerPage();
+    if (g_lines.empty()) {
+        lvgl_port_unlock();
+        return;
+    }
+    if (g_first_line + per_page < g_lines.size()) {
+        g_first_line += per_page;
+        if (g_first_line + per_page > g_lines.size()) {
+            g_first_line = g_lines.size() > static_cast<size_t>(per_page)
+                               ? g_lines.size() - static_cast<size_t>(per_page)
+                               : 0;
+        }
+    }
+    Refresh();
+    lvgl_port_unlock();
+}
+
+void lv_display_page_prev() {
+    if (!lvgl_port_lock(1000)) {
+        return;
+    }
+    EnsureInit();
+    int per_page = LinesPerPage();
+    if (g_first_line >= static_cast<size_t>(per_page)) {
+        g_first_line -= per_page;
+    } else {
+        g_first_line = 0;
+    }
+    Refresh();
+    lvgl_port_unlock();
+}
+
+void lv_display_set_status(const char* status) {
+    if (!lvgl_port_lock(1000)) {
+        return;
+    }
+    EnsureInit();
+    g_status_text = status == nullptr ? "" : status;
+    Refresh();
+    lvgl_port_unlock();
+}
+
+// 状态钩子在黑板上不做处理：原生表情界面继续按原有逻辑运行。
+void lv_display_set_wake_up() {
+    if (lv_display_is_blackboard()) {
+        ESP_LOGD(TAG, "wake up");
+    }
+}
 void lv_display_set_listening() {}
 void lv_display_set_thinking() {}
 void lv_display_set_speaking() {}
 void lv_display_set_idle() {}
-void lv_display_set_error(const char* msg) { (void)msg; }
+void lv_display_set_error(const char* msg) {
+    (void)msg;
+}
