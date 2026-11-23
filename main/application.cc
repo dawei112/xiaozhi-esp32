@@ -7,6 +7,7 @@
 #include "display.h"
 #include "blackboard_display.h"
 #include "music_player.h"
+#include "radio_player.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -161,6 +162,100 @@ void Application::Initialize() {
     // quietly: the only sign on this device was an alert at boot and a sad face, which is
     // easy to see and hard to connect to a tool list.
     mcp_server.LogToolInventory();
+
+    // ---- 黑板 / 音乐 / 电台：注册成 MCP 工具，让模型知道设备有这些能力 ----
+    mcp_server.AddTool(
+        "self.blackboard_write",
+        "把一段文字写到设备屏幕的黑板字幕上（黑底白字，支持中文）。适合讲题、分步骤讲解、显示长文本，"
+        "用户说“打开黑板/黑板模式”后设备会切换到该界面，调用本工具可直接把内容显示上去。",
+        PropertyList({Property("text", kPropertyTypeString).SetMaxLength(2000)}),
+        [](const PropertyList& properties) -> ToolResult {
+            std::string text = properties["text"].value<std::string>();
+            if (text.empty()) {
+                return std::unexpected(std::string("text 不能为空"));
+            }
+            Application::GetInstance().Schedule([text]() {
+                lv_display_switch_blackboard(true);
+                lv_display_set_status("黑板模式");
+                lv_display_append_message("assistant", text.c_str());
+            });
+            return std::string("已显示在黑板上");
+        });
+    mcp_server.AddTool("self.blackboard_clear", "清空黑板字幕内容",
+                       PropertyList({}), [](const PropertyList&) -> ToolResult {
+                           Application::GetInstance().Schedule([]() { lv_display_clear(); });
+                           return std::string("黑板已清空");
+                       });
+    mcp_server.AddTool("self.blackboard_close", "退出黑板模式，回到默认表情界面",
+                       PropertyList({}), [](const PropertyList&) -> ToolResult {
+                           Application::GetInstance().Schedule(
+                               []() { lv_display_switch_blackboard(false); });
+                           return std::string("已退出黑板模式");
+                       });
+    mcp_server.AddTool(
+        "self.music_play",
+        "播放音乐（OGG/Opus 音频直链）。不传 url 时播放设备内置曲目。",
+        PropertyList({Property("url", kPropertyTypeString, std::string()).SetMaxLength(512)}),
+        [](const PropertyList& properties) -> ToolResult {
+            std::string url = properties["url"].value<std::string>();
+            MusicPlayer& player = MusicPlayer::GetInstance();
+            if (!url.empty()) {
+                std::vector<MusicTrack> list;
+                list.push_back({"网络音乐", url});
+                player.SetPlaylist(list);
+            }
+            if (!player.Play(0)) {
+                return std::unexpected(std::string("播放失败"));
+            }
+            return std::string("开始播放音乐");
+        });
+    mcp_server.AddTool("self.music_stop", "停止播放音乐", PropertyList({}),
+                       [](const PropertyList&) -> ToolResult {
+                           MusicPlayer::GetInstance().Stop(2000);
+                           return std::string("音乐已停止");
+                       });
+    mcp_server.AddTool("self.radio_list", "列出设备内置的网络电台频道名，可用于挑选要播放的电台",
+                       PropertyList({}), [](const PropertyList&) -> ToolResult {
+                           RadioPlayer& radio = RadioPlayer::GetInstance();
+                           std::string out;
+                           for (int i = 0; i < radio.StationCount(); i++) {
+                               if (!out.empty()) {
+                                   out += "，";
+                               }
+                               out += radio.StationName(i);
+                           }
+                           return out;
+                       });
+    mcp_server.AddTool(
+        "self.radio_play",
+        "打开网络电台听广播。name 可填台名关键词（如“襄阳”“交通”“音乐”），留空则播放默认台。",
+        PropertyList({Property("name", kPropertyTypeString, std::string()).SetMaxLength(64)}),
+        [](const PropertyList& properties) -> ToolResult {
+            std::string name = properties["name"].value<std::string>();
+            RadioPlayer& radio = RadioPlayer::GetInstance();
+            bool ok = name.empty() ? radio.Play(0) : radio.PlayByName(name);
+            if (!ok) {
+                return std::unexpected(std::string("没有找到该电台，可调用 self.radio_list 查看频道"));
+            }
+            std::string title = radio.CurrentStationName();
+            Application::GetInstance().Schedule([title]() {
+                lv_display_switch_blackboard(true);
+                lv_display_set_status(("📻 " + title).c_str());
+            });
+            return std::string("正在播放: " + title);
+        });
+    mcp_server.AddTool("self.radio_next", "切换到下一个网络电台频道", PropertyList({}),
+                       [](const PropertyList&) -> ToolResult {
+                           RadioPlayer& radio = RadioPlayer::GetInstance();
+                           radio.Next();
+                           return std::string("已切到: " + radio.CurrentStationName());
+                       });
+    mcp_server.AddTool("self.radio_stop", "关闭网络电台广播", PropertyList({}),
+                       [](const PropertyList&) -> ToolResult {
+                           RadioPlayer::GetInstance().Stop(2000);
+                           return std::string("电台已关闭");
+                       });
+
 
     // Set network event callback for UI updates and network state handling
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
@@ -759,6 +854,49 @@ void Application::InitializeProtocol() {
                         lv_display_page_prev();
                     } else if (VoiceCommandMatch(message, {"下一页", "向后翻页", "往后翻"})) {
                         lv_display_page_next();
+                    } else if (VoiceCommandMatch(message, {"打开电台", "听广播", "开电台", "播放电台",
+                                                           "打开收音机", "听电台", "放广播"})) {
+                        lv_display_switch_blackboard(true);
+                        RadioPlayer& radio = RadioPlayer::GetInstance();
+                        bool ok = false;
+                        // 先看用户是不是点了具体台名，比如“听湖北交通广播”
+                        std::string station_name = message;
+                        size_t pos = station_name.find("听");
+                        if (pos != std::string::npos && pos + 1 < station_name.size()) {
+                            station_name = station_name.substr(pos + 1);
+                        }
+                        for (size_t i = 0; i < station_name.size(); i++) {
+                            if (station_name[i] == '台' || station_name[i] == '吧' ||
+                                station_name[i] == '。' || station_name[i] == '.' ||
+                                station_name[i] == '!' || station_name[i] == '!' ||
+                                station_name[i] == '?') {
+                                station_name = station_name.substr(0, i);
+                                break;
+                            }
+                        }
+                        if (station_name.size() >= 2 && station_name != "电台" &&
+                            station_name != "广播" && station_name != "收音机") {
+                            ok = radio.PlayByName(station_name);
+                        }
+                        if (!ok) {
+                            ok = radio.Play(0);
+                        }
+                        if (ok) {
+                            lv_display_set_status(("📻 " + radio.CurrentStationName()).c_str());
+                        } else {
+                            lv_display_set_status("📻 收听失败，请检查网络");
+                        }
+                    } else if (VoiceCommandMatch(message, {"换个台", "下一个台", "下一台", "切换电台",
+                                                           "换电台", "换个频道"})) {
+                        RadioPlayer::GetInstance().Next();
+                        lv_display_set_status(("📻 " + RadioPlayer::GetInstance().CurrentStationName()).c_str());
+                    } else if (VoiceCommandMatch(message, {"上一个台", "上一台", "往前换台"})) {
+                        RadioPlayer::GetInstance().Prev();
+                        lv_display_set_status(("📻 " + RadioPlayer::GetInstance().CurrentStationName()).c_str());
+                    } else if (VoiceCommandMatch(message, {"关闭电台", "关掉电台", "关掉广播",
+                                                           "停止电台", "不听广播了"})) {
+                        RadioPlayer::GetInstance().Stop(2000);
+                        lv_display_set_status("📻 已关闭电台");
                     } else if (VoiceCommandMatch(message, {"放首歌", "听歌", "来首歌", "放首音乐",
                                                           "播放音乐", "开始听歌"})) {
                         lv_display_switch_blackboard(true);
@@ -1025,6 +1163,11 @@ void Application::HandleWakeWordDetectedEvent() {
     if (MusicPlayer::GetInstance().IsPlaying()) {
         MusicPlayer::GetInstance().Pause();
         lv_display_set_status("♪ 音乐已暂停");
+    }
+    // 电台是直播流，没法暂停续播，直接停掉（说“听广播”重新开）
+    if (RadioPlayer::GetInstance().IsPlaying()) {
+        RadioPlayer::GetInstance().Stop(2000);
+        lv_display_set_status("📻 电台已暂停");
     }
 
     if (state == kDeviceStateIdle) {
