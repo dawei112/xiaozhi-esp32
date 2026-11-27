@@ -7,7 +7,6 @@
 #include "display.h"
 #include "blackboard_display.h"
 #include "music_player.h"
-#include "radio_player.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -213,47 +212,6 @@ void Application::Initialize() {
                        [](const PropertyList&) -> ToolResult {
                            MusicPlayer::GetInstance().Stop(2000);
                            return std::string("音乐已停止");
-                       });
-    mcp_server.AddTool("self.radio_list", "列出设备内置的网络电台频道名，可用于挑选要播放的电台",
-                       PropertyList(std::vector<Property>{}), [](const PropertyList&) -> ToolResult {
-                           RadioPlayer& radio = RadioPlayer::GetInstance();
-                           std::string out;
-                           for (int i = 0; i < radio.StationCount(); i++) {
-                               if (!out.empty()) {
-                                   out += "，";
-                               }
-                               out += radio.StationName(i);
-                           }
-                           return out;
-                       });
-    mcp_server.AddTool(
-        "self.radio_play",
-        "打开网络电台听广播。name 可填台名关键词（如“襄阳”“交通”“音乐”），留空则播放默认台。",
-        PropertyList({Property("name", kPropertyTypeString, std::string()).SetMaxLength(64)}),
-        [](const PropertyList& properties) -> ToolResult {
-            std::string name = properties["name"].value<std::string>();
-            RadioPlayer& radio = RadioPlayer::GetInstance();
-            bool ok = name.empty() ? radio.Play(0) : radio.PlayByName(name);
-            if (!ok) {
-                return std::unexpected(std::string("没有找到该电台，可调用 self.radio_list 查看频道"));
-            }
-            std::string title = radio.CurrentStationName();
-            Application::GetInstance().Schedule([title]() {
-                lv_display_switch_blackboard(true);
-                lv_display_set_status(("📻 " + title).c_str());
-            });
-            return std::string("正在播放: " + title);
-        });
-    mcp_server.AddTool("self.radio_next", "切换到下一个网络电台频道", PropertyList(std::vector<Property>{}),
-                       [](const PropertyList&) -> ToolResult {
-                           RadioPlayer& radio = RadioPlayer::GetInstance();
-                           radio.Next();
-                           return std::string("已切到: " + radio.CurrentStationName());
-                       });
-    mcp_server.AddTool("self.radio_stop", "关闭网络电台广播", PropertyList(std::vector<Property>{}),
-                       [](const PropertyList&) -> ToolResult {
-                           RadioPlayer::GetInstance().Stop(2000);
-                           return std::string("电台已关闭");
                        });
 
 
@@ -723,8 +681,13 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+        // TCP 有序：tts stop 到达时，这一轮的音频帧早已排在前面的报文里。
+        // 因此 listening 刚切换的那一小段时间内到达的包，属于上一句还没播完的尾巴，
+        // 必须收下，否则“说到一半”就没了声音。
+        auto state = GetDeviceState();
+        if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+            // 队列满时等一会儿而不是直接丢掉新包：丢一帧就会静音 60ms，连续丢就是断句。
+            audio_service_.PushPacketToDecodeQueue(std::move(packet), true);
         }
     });
 
@@ -854,52 +817,6 @@ void Application::InitializeProtocol() {
                         lv_display_page_prev();
                     } else if (VoiceCommandMatch(message, {"下一页", "向后翻页", "往后翻"})) {
                         lv_display_page_next();
-                    } else if (VoiceCommandMatch(message, {"打开电台", "听广播", "开电台", "播放电台",
-                                                           "打开收音机", "听电台", "放广播"})) {
-                        lv_display_switch_blackboard(true);
-                        RadioPlayer& radio = RadioPlayer::GetInstance();
-                        bool ok = false;
-                        // 先看用户是不是点了具体台名，比如“听湖北交通广播”
-                        std::string station_name = message;
-                        size_t pos = station_name.find("听");
-                        if (pos != std::string::npos && pos + 1 < station_name.size()) {
-                            station_name = station_name.substr(pos + 1);
-                        }
-                        // 去掉句末的语气词和标点
-                        const std::vector<std::string> kTailMarkers = {"台", "吧", "。", ".", "!", "?", "！", "？"};
-                        size_t cut = std::string::npos;
-                        for (const auto& marker : kTailMarkers) {
-                            size_t p = station_name.rfind(marker);
-                            if (p != std::string::npos && p < cut) {
-                                cut = p;
-                            }
-                        }
-                        if (cut != std::string::npos) {
-                            station_name = station_name.substr(0, cut);
-                        }
-                        if (station_name.size() >= 2 && station_name != "电台" &&
-                            station_name != "广播" && station_name != "收音机") {
-                            ok = radio.PlayByName(station_name);
-                        }
-                        if (!ok) {
-                            ok = radio.Play(0);
-                        }
-                        if (ok) {
-                            lv_display_set_status(("📻 " + radio.CurrentStationName()).c_str());
-                        } else {
-                            lv_display_set_status("📻 收听失败，请检查网络");
-                        }
-                    } else if (VoiceCommandMatch(message, {"换个台", "下一个台", "下一台", "切换电台",
-                                                           "换电台", "换个频道"})) {
-                        RadioPlayer::GetInstance().Next();
-                        lv_display_set_status(("📻 " + RadioPlayer::GetInstance().CurrentStationName()).c_str());
-                    } else if (VoiceCommandMatch(message, {"上一个台", "上一台", "往前换台"})) {
-                        RadioPlayer::GetInstance().Prev();
-                        lv_display_set_status(("📻 " + RadioPlayer::GetInstance().CurrentStationName()).c_str());
-                    } else if (VoiceCommandMatch(message, {"关闭电台", "关掉电台", "关掉广播",
-                                                           "停止电台", "不听广播了"})) {
-                        RadioPlayer::GetInstance().Stop(2000);
-                        lv_display_set_status("📻 已关闭电台");
                     } else if (VoiceCommandMatch(message, {"放首歌", "听歌", "来首歌", "放首音乐",
                                                           "播放音乐", "开始听歌"})) {
                         lv_display_switch_blackboard(true);
@@ -1167,12 +1084,6 @@ void Application::HandleWakeWordDetectedEvent() {
         MusicPlayer::GetInstance().Pause();
         lv_display_set_status("♪ 音乐已暂停");
     }
-    // 电台是直播流，没法暂停续播，直接停掉（说“听广播”重新开）
-    if (RadioPlayer::GetInstance().IsPlaying()) {
-        RadioPlayer::GetInstance().Stop(2000);
-        lv_display_set_status("📻 电台已暂停");
-    }
-
     if (state == kDeviceStateIdle) {
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateNotifying) {
@@ -1300,11 +1211,11 @@ void Application::HandleStateChangedEvent() {
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // For auto mode, wait for the playback queue to drain before enabling
-                // voice processing. This prevents audio truncation when STOP arrives
-                // late due to network jitter. Instead of blocking the main loop here,
-                // defer the start until MAIN_EVENT_PLAYBACK_DRAINED arrives.
-                if (listening_mode_ == kListeningModeAutoStop && !audio_service_.IsPlaybackIdle()) {
+                // 只要喇叭里还有上一句没播完的音频，就必须等它播完再开语音处理：
+                // EnableVoiceProcessing(true) 里会 ResetDecoder()，提前进去会把剩余音频整段清掉，
+                // 表现出来就是“话说到一半突然停”。实时模式（AEC 常开）以前不做这个等待，
+                // 所以每次 tts stop 都会截断，这里对所有模式统一处理。
+                if (!audio_service_.IsPlaybackIdle()) {
                     pending_listening_start_ = true;
                 } else {
                     StartListeningAudio();
