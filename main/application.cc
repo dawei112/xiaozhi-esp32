@@ -7,6 +7,7 @@
 #include "display.h"
 #include "blackboard_display.h"
 #include "music_player.h"
+#include "radio_player.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -216,6 +217,49 @@ void Application::Initialize() {
                        [](const PropertyList&) -> ToolResult {
                            MusicPlayer::GetInstance().Stop(2000);
                            return std::string("音乐已停止");
+                       });
+
+    // ---- 网络电台（高清 MP3 直播流）----
+    mcp_server.AddTool("self.radio_list", "列出设备内置的网络电台频道名，可用于挑选要播放的电台",
+                       PropertyList(std::vector<Property>{}), [](const PropertyList&) -> ToolResult {
+                           RadioPlayer& radio = RadioPlayer::GetInstance();
+                           std::string out;
+                           for (int i = 0; i < radio.StationCount(); i++) {
+                               if (!out.empty()) {
+                                   out += "，";
+                               }
+                               out += radio.StationName(i);
+                           }
+                           return out;
+                       });
+    mcp_server.AddTool(
+        "self.radio_play",
+        "打开网络电台听广播。name 可填台名关键词（如“音乐”“交通”“新闻”“故事”），留空则播放默认台。",
+        PropertyList({Property("name", kPropertyTypeString, std::string()).SetMaxLength(64)}),
+        [](const PropertyList& properties) -> ToolResult {
+            std::string name = properties["name"].value<std::string>();
+            RadioPlayer& radio = RadioPlayer::GetInstance();
+            bool ok = name.empty() ? radio.Play(0) : radio.PlayByName(name);
+            if (!ok) {
+                return std::unexpected(std::string("没有找到该电台，可调用 self.radio_list 查看频道"));
+            }
+            std::string title = radio.CurrentStationName();
+            Application::GetInstance().Schedule([title]() {
+                lv_display_switch_blackboard(true);
+                lv_display_set_status(("📻 " + title).c_str());
+            });
+            return std::string("正在播放: " + title);
+        });
+    mcp_server.AddTool("self.radio_next", "切换到下一个网络电台频道", PropertyList(std::vector<Property>{}),
+                       [](const PropertyList&) -> ToolResult {
+                           RadioPlayer& radio = RadioPlayer::GetInstance();
+                           radio.Next();
+                           return std::string("已切到: " + radio.CurrentStationName());
+                       });
+    mcp_server.AddTool("self.radio_stop", "关闭网络电台广播", PropertyList(std::vector<Property>{}),
+                       [](const PropertyList&) -> ToolResult {
+                           RadioPlayer::GetInstance().Stop(2000);
+                           return std::string("电台已关闭");
                        });
 
 
@@ -847,6 +891,51 @@ void Application::InitializeProtocol() {
                         lv_display_set_status("♪ 已停止");
                     } else if (VoiceCommandMatch(message, {"下一首", "切歌", "换一首"})) {
                         MusicPlayer::GetInstance().Next();
+                    } else if (VoiceCommandMatch(message, {"打开电台", "听广播", "开电台", "播放电台",
+                                                          "打开收音机", "听电台", "放广播"})) {
+                        lv_display_switch_blackboard(true);
+                        RadioPlayer& radio = RadioPlayer::GetInstance();
+                        bool ok = false;
+                        // 先看用户是不是说了具体台名，比如“听湖北交通广播”
+                        std::string station_name = message;
+                        size_t pos = station_name.find("听");
+                        if (pos != std::string::npos && pos + 1 < station_name.size()) {
+                            station_name = station_name.substr(pos + 1);
+                        }
+                        const std::vector<std::string> kTailMarkers = {"台", "吧", "。", ".", "!", "?", "！", "？"};
+                        size_t cut = std::string::npos;
+                        for (const auto& marker : kTailMarkers) {
+                            size_t p = station_name.rfind(marker);
+                            if (p != std::string::npos && p < cut) {
+                                cut = p;
+                            }
+                        }
+                        if (cut != std::string::npos) {
+                            station_name = station_name.substr(0, cut);
+                        }
+                        if (station_name.size() >= 2 && station_name != "电台" &&
+                            station_name != "广播" && station_name != "收音机") {
+                            ok = radio.PlayByName(station_name);
+                        }
+                        if (!ok) {
+                            ok = radio.Play(0);
+                        }
+                        if (ok) {
+                            lv_display_set_status(("📻 " + radio.CurrentStationName()).c_str());
+                        } else {
+                            lv_display_set_status("📻 收听失败，请检查网络");
+                        }
+                    } else if (VoiceCommandMatch(message, {"换个台", "下一个台", "下一台", "切换电台",
+                                                          "换电台", "换个频道"})) {
+                        RadioPlayer::GetInstance().Next();
+                        lv_display_set_status(("📻 " + RadioPlayer::GetInstance().CurrentStationName()).c_str());
+                    } else if (VoiceCommandMatch(message, {"上一个台", "上一台", "往前换台"})) {
+                        RadioPlayer::GetInstance().Prev();
+                        lv_display_set_status(("📻 " + RadioPlayer::GetInstance().CurrentStationName()).c_str());
+                    } else if (VoiceCommandMatch(message, {"关闭电台", "关掉电台", "关掉广播",
+                                                          "停止电台", "不听广播了"})) {
+                        RadioPlayer::GetInstance().Stop(2000);
+                        lv_display_set_status("📻 已关闭电台");
                     }
                 });
             }
@@ -1089,6 +1178,11 @@ void Application::HandleWakeWordDetectedEvent() {
     if (MusicPlayer::GetInstance().IsPlaying()) {
         MusicPlayer::GetInstance().Pause();
         lv_display_set_status("♪ 音乐已暂停");
+    }
+    // 电台是直播流，没法暂停续播，唤醒时直接停掉（说“听广播”重新开）。
+    if (RadioPlayer::GetInstance().IsPlaying()) {
+        RadioPlayer::GetInstance().Stop(2000);
+        lv_display_set_status("📻 电台已暂停");
     }
     if (state == kDeviceStateIdle) {
         BeginWakeWordInvoke(wake_word);
