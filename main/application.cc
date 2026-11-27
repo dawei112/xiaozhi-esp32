@@ -114,6 +114,10 @@ void Application::Initialize() {
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
+    // 板上有回采参考通道（AUDIO_INPUT_REFERENCE），显式开启设备侧 AEC。
+    // 不显式开的话 AFE 初始化后会先把 AEC 关掉，只有唤醒词使能时才重新打开，
+    // 播报时麦克风收到自家喇叭声音就会被服务端当成“用户插话”，造成说到一半被掐断。
+    audio_service_.EnableDeviceAec(true);
     ESP_LOGI(TAG, "After board/audio init");
     SystemInfo::PrintHeapStats();
 
@@ -352,17 +356,9 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
-            // 半双工修复：播报（speaking）期间不上行麦克风音频。
-            // 本板 AEC 实际不生效，喇叭声音被麦克风拾到后原样上传，
-            // 服务端 ASR 把它识别成“用户在说话”，随即下发 tts stop 打断播报，
-            // 表现就是“说到一半自己停住、并自己进入聆听中”。
-            // 这里在 speaking 状态下把编码好的上行包直接丢弃（仍从队列取出，
-            // 避免队列满阻塞 Opus 编码任务），等 TTS 结束切到 listening 再恢复上行。
-            const bool mute_uplink = (GetDeviceState() == kDeviceStateSpeaking);
+            // 设备侧 AEC 已开启（见 Initialize），扬声器回声会在 AFE 里被抵消，
+            // 因此播报期间恢复麦克风上行，保留“说话打断”。
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (mute_uplink) {
-                    continue;
-                }
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     // Drop the remaining packets. Leaving them in the queue would
                     // stall the Opus codec task (it waits for queue space), which in
